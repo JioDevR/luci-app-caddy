@@ -4,6 +4,8 @@ Interfaz web (**LuCI**) para instalar, configurar y controlar **Caddy v2.11.4** 
 
 **Versión:** `1.0.3-r1` · **Caddy:** `2.11.4` (`dns.providers.cloudflare` incluido) · **Arquitecturas:** `x86_64` y `aarch64` · **Paquete:** `.apk` (apk-tools v3)
 
+Notas de la versión: [RELEASE_NOTES.md](RELEASE_NOTES.md)
+
 ---
 
 ## Índice
@@ -130,22 +132,43 @@ luci-app-caddy/
 
 ## Instalación
 
-### 1. Copiar el paquete
+### Instalación rápida (en 1 línea, recomendada)
+
+Desde el router por SSH (detecta automáticamente `x86_64` o `aarch64`, verifica el `sha256sum` e instala desde [GitHub Releases](https://github.com/JioDevR/luci-app-caddy/releases)):
+
+```sh
+wget -qO- https://raw.githubusercontent.com/JioDevR/luci-app-caddy/main/install.sh | sh
+```
+
+Para instalar una versión específica:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/JioDevR/luci-app-caddy/main/install.sh | VERSION=v1.0.3 sh
+```
+
+---
+
+### Instalación manual / offline
+
+Si tu router no tiene acceso a Internet, descarga el paquete de tu arquitectura desde `dist/` o desde Releases (`luci-app-caddy-x86_64.apk`, `luci-app-caddy-aarch64.apk`, o `luci-app-caddy-all.apk` con ambos binarios):
+
+#### 1. Copiar el paquete
 
 ```bash
-scp -O dist/luci-app-caddy.apk root@192.168.1.1:/tmp/
+# Sustituye <ARCH> por x86_64, aarch64 o all
+scp -O dist/luci-app-caddy-<ARCH>.apk root@192.168.1.1:/tmp/
 ```
 
 > `-O` fuerza el protocolo SCP clásico porque **dropbear** (SSH de OpenWrt) no incluye SFTP.
 > Alternativa sin `scp`:
 > ```bash
-> ssh root@192.168.1.1 'cat > /tmp/luci-app-caddy.apk' < dist/luci-app-caddy.apk
+> ssh root@192.168.1.1 'cat > /tmp/luci-app-caddy-<ARCH>.apk' < dist/luci-app-caddy-<ARCH>.apk
 > ```
 
-### 2. Instalar
+#### 2. Instalar
 
 ```bash
-ssh root@192.168.1.1 'apk add --allow-untrusted /tmp/luci-app-caddy.apk'
+ssh root@192.168.1.1 'apk add --allow-untrusted /tmp/luci-app-caddy-<ARCH>.apk'
 ```
 
 Salida esperada (resumida):
@@ -169,9 +192,11 @@ El acceso SSH (puerto 22) no cambia. Si LuCI ya estaba en 8080/8443, no se toca 
 
 ### Actualizar
 
+Con conexión a Internet, puedes volver a ejecutar el instalador rápido (`install.sh`) o actualizar manualmente:
+
 ```bash
-scp -O dist/luci-app-caddy.apk root@192.168.1.1:/tmp/
-ssh root@192.168.1.1 'apk add --allow-untrusted --upgrade /tmp/luci-app-caddy.apk'
+scp -O dist/luci-app-caddy-<ARCH>.apk root@192.168.1.1:/tmp/
+ssh root@192.168.1.1 'apk add --allow-untrusted --upgrade /tmp/luci-app-caddy-<ARCH>.apk'
 ```
 
 - Tu `/etc/config/caddy` se conserva (conffile); la versión nueva se deja en `/etc/config/caddy.apk-new` para revisar.
@@ -184,7 +209,7 @@ ssh root@192.168.1.1 'apk add --allow-untrusted --upgrade /tmp/luci-app-caddy.ap
 
 ```bash
 # Reinstalación limpia (conserva /etc/config/caddy)
-ssh root@192.168.1.1 'apk del luci-app-caddy && apk add --allow-untrusted /tmp/luci-app-caddy.apk'
+ssh root@192.168.1.1 'apk del luci-app-caddy && apk add --allow-untrusted /tmp/luci-app-caddy-<ARCH>.apk'
 ```
 
 ### Verificar la instalación
@@ -460,7 +485,10 @@ El script:
 4. Genera el post-install/post-upgrade.
 5. Empaqueta con `apk mkpkg` y verifica contenido/propietarios.
 
-Salida: `dist/luci-app-caddy.apk` y `dist/luci-app-caddy.apk.sha256`.
+Salida:
+- `dist/luci-app-caddy-x86_64.apk` y `.sha256` (~15 MB)
+- `dist/luci-app-caddy-aarch64.apk` y `.sha256` (~15 MB)
+- `dist/luci-app-caddy-all.apk` y `.sha256` (~31 MB, todo-en-uno offline)
 
 ### Actualizar la versión
 

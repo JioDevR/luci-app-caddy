@@ -17,9 +17,9 @@ if [ ! -x "$APK_TOOL" ]; then
     fi
 fi
 
-# Limpiar paquetes anteriores en dist/
+# Limpiar paquetes y checksums anteriores en dist/
 mkdir -p "$DIST_DIR"
-rm -f "$DIST_DIR"/*.apk
+rm -f "$DIST_DIR"/*.apk "$DIST_DIR"/*.sha256
 
 echo "=========================================================="
 echo "  Construyendo APK nativo para OpenWrt (apk-tools v3 / OpenWrt 24.x+)"
@@ -207,8 +207,18 @@ verify_package() {
     echo "   [OK] Contenido: sin ficheros basura y propiedad root:root"
 }
 
-# Paquete Todo-en-Uno (Contiene binarios x86_64 y ARM64 con detección automática)
-build_apk "luci-app-caddy.apk" "all-in-one" "noarch"
+# Paquetes separados por arquitectura (~15 MB cada uno) + Todo-en-Uno para uso offline
+build_apk "luci-app-caddy-x86_64.apk" "amd64" "noarch"
+build_apk "luci-app-caddy-aarch64.apk" "arm64" "noarch"
+build_apk "luci-app-caddy-all.apk" "all-in-one" "noarch"
+
+# Checksums reproducibles (nombre relativo, portable)
+(
+    cd "$DIST_DIR"
+    for pkg in luci-app-caddy-x86_64.apk luci-app-caddy-aarch64.apk luci-app-caddy-all.apk; do
+        [ -f "$pkg" ] && sha256sum "$pkg" > "${pkg}.sha256"
+    done
+)
 
 echo ""
 echo "=== Paquetes generados con éxito en dist/ ==="
