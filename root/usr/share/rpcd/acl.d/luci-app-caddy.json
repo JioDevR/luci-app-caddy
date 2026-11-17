@@ -1,0 +1,34 @@
+{
+	"luci-app-caddy": {
+		"description": "Grant access to Caddy configuration and service control",
+		"read": {
+			"uci": [ "caddy", "uhttpd" ],
+			"ubus": {
+				"luci.caddy": [
+					"status",
+					"get_bin_info",
+					"validate_caddyfile",
+					"get_caddyfile",
+					"test_caddy_run"
+				],
+				"service": [ "list" ]
+			}
+		},
+		"write": {
+			"uci": [ "caddy", "uhttpd" ],
+			"ubus": {
+				"luci.caddy": [
+					"service_action",
+					"install_bin",
+					"free_ports",
+					"set_caddyfile",
+					"restore_generated",
+					"sync_general",
+					"generate_caddyfile",
+					"sync_from_caddyfile",
+					"test_caddy_run"
+				]
+			}
+		}
+	}
+}

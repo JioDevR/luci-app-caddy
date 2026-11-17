@@ -1,0 +1,51 @@
+#!/bin/sh
+
+# 0. Limpiar regla de ejemplo obsoleta si existe en UCI
+if [ -f /etc/config/caddy ]; then
+	count="$(uci -q show caddy 2>/dev/null | grep -c '=proxy$')"
+	i=$((count - 1))
+	while [ "$i" -ge 0 ]; do
+		d="$(uci -q get "caddy.@proxy[$i].domain" 2>/dev/null)"
+		n="$(uci -q get "caddy.@proxy[$i].name" 2>/dev/null)"
+		if [ "$d" = "ejemplo.tudominio.com" ] || [ "$n" = "ejemplo-web" ]; then
+			uci -q delete "caddy.@proxy[$i]"
+		fi
+		i=$((i - 1))
+	done
+	uci -q commit caddy 2>/dev/null || true
+fi
+
+# 1. Liberar puertos 80 y 443 ocupados por LuCI para Caddy
+if [ -x /usr/lib/caddy/free-ports.sh ]; then
+	/usr/lib/caddy/free-ports.sh --quiet
+fi
+
+# 2. Ejecutar el instalador inteligente todo-en-uno si existe
+if [ -x /usr/lib/caddy/caddy-installer.sh ]; then
+	/usr/lib/caddy/caddy-installer.sh --install >/dev/null 2>&1
+fi
+
+# 3. Generar Caddyfile inicial en /etc/caddy/Caddyfile y habilitar servicio
+if [ -x /usr/lib/caddy/generate-caddyfile.sh ]; then
+	/usr/lib/caddy/generate-caddyfile.sh
+fi
+if [ -f /etc/init.d/caddy ]; then
+	# "reload" es el verbo válido de rc.common (reload_service es una función
+	# interna del init script, no un comando: imprimía la ayuda y no hacía nada)
+	/etc/init.d/caddy reload >/dev/null 2>&1 || true
+	[ "$(uci -q get caddy.general.enabled 2>/dev/null)" = "1" ] && /etc/init.d/caddy enable
+fi
+
+# 3b. Permisos: la configuración contiene el token de Cloudflare en claro
+chmod 600 /etc/config/caddy 2>/dev/null || true
+chmod 600 /etc/caddy/Caddyfile 2>/dev/null || true
+
+# 4. Registrar caddy en ucitrack para que LuCI ejecute reload_service al "Guardar y aplicar"
+if command -v uci >/dev/null 2>&1; then
+	uci -q delete ucitrack.caddy 2>/dev/null || true
+	uci -q set ucitrack.caddy=caddy
+	uci -q set ucitrack.caddy.init='caddy'
+	uci -q commit ucitrack 2>/dev/null || true
+fi
+
+exit 0

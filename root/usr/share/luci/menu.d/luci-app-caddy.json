@@ -1,0 +1,56 @@
+{
+	"admin/services/caddy": {
+		"title": "Caddy",
+		"action": {
+			"type": "alias",
+			"path": "admin/services/caddy/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-caddy" ]
+		}
+	},
+	"admin/services/caddy/status": {
+		"title": "Estado y Control",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "caddy/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-caddy" ]
+		}
+	},
+	"admin/services/caddy/general": {
+		"title": "Configuración General",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "caddy/general"
+		},
+		"depends": {
+			"acl": [ "luci-app-caddy" ]
+		}
+	},
+	"admin/services/caddy/proxies": {
+		"title": "Reverse Proxies",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "caddy/proxies"
+		},
+		"depends": {
+			"acl": [ "luci-app-caddy" ]
+		}
+	},
+	"admin/services/caddy/caddyfile": {
+		"title": "Caddyfile",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "caddy/caddyfile"
+		},
+		"depends": {
+			"acl": [ "luci-app-caddy" ]
+		}
+	}
+}

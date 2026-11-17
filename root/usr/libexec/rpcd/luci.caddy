@@ -1,0 +1,596 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+CADDY_BIN="/usr/bin/caddy"
+[ -x "$CADDY_BIN" ] || CADDY_BIN="$(which caddy 2>/dev/null)"
+CADDYFILE="/etc/caddy/Caddyfile"
+CUSTOM_FILE="/etc/caddy/Caddyfile.custom"
+
+get_arch() {
+	local m
+	m="$(uname -m)"
+	case "$m" in
+		x86_64|amd64) echo "x86_64" ;;
+		aarch64|arm64) echo "aarch64" ;;
+		armv7*|armv6*) echo "arm" ;;
+		mips*|mipsel*) echo "mips" ;;
+		*) echo "$m" ;;
+	esac
+}
+
+json_escape() {
+	local s="$1"
+	s="${s//\\/\\\\}"
+	s="${s//\"/\\\"}"
+	s="${s//$'\n'/\\n}"
+	s="${s//$'\r'/}"
+	s="${s//$'\t'/\\t}"
+	printf '%s' "$s"
+}
+
+get_caddy_bin() {
+	local b="$CADDY_BIN"
+	[ -x "$b" ] || b="$(uci -q get caddy.general.bin_path)"
+	[ -x "$b" ] || b="$(which caddy 2>/dev/null)"
+	[ -x "$b" ] && printf '%s' "$b"
+}
+
+is_valid_token() {
+	case "$1" in
+		"") return 1 ;;
+		*[!A-Za-z0-9_-]*) return 1 ;;
+	esac
+	[ "${#1}" -ge 32 ] || return 1
+	return 0
+}
+
+# Oculta el token de Cloudflare en cualquier salida que se devuelva a la UI o
+# se escriba en el log (Caddy lo incluye en sus mensajes de error).
+mask_secrets() {
+	local s="$1" tok
+	tok="$(uci -q get caddy.general.cloudflare_token)"
+	if [ -n "$tok" ]; then
+		s="$(printf '%s' "$s" | sed "s|$tok|***|g")"
+	fi
+	printf '%s' "$s"
+}
+
+# Devuelve el PID del proceso gestionado por procd (vacío si está detenido)
+service_pid() {
+	local pid=""
+	if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+		pid="$(ubus call service list '{"name":"caddy","verbose":true}' 2>/dev/null \
+			| jsonfilter -e '@.caddy.instances.*.pid' 2>/dev/null | head -n 1)"
+	fi
+	if [ -z "$pid" ] && command -v pgrep >/dev/null 2>&1; then
+		pid="$(pgrep -f "^$CADDY_BIN run" 2>/dev/null | head -n 1)"
+	fi
+	printf '%s' "$pid"
+}
+
+reload_running_caddy() {
+	local bin
+	bin="$(get_caddy_bin)"
+	[ -n "$bin" ] || return 1
+	local cf_token
+	cf_token="$(uci -q get caddy.general.cloudflare_token)"
+	is_valid_token "$cf_token" || cf_token=""
+	[ -n "$cf_token" ] && export CLOUDFLARE_API_TOKEN="$cf_token"
+	"$bin" reload --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1
+}
+
+action_status() {
+	local pid enabled=0 uci_enabled
+	pid="$(service_pid)"
+	uci_enabled="$(uci -q get caddy.general.enabled)"
+	if [ "$uci_enabled" = "1" ]; then
+		enabled=1
+	elif [ -z "$uci_enabled" ] && [ -f /etc/init.d/caddy ] && /etc/init.d/caddy enabled 2>/dev/null; then
+		# Compatibilidad: UCI no disponible pero el servicio está enlazado
+		enabled=1
+	fi
+
+	if [ -n "$pid" ]; then
+		printf '{"running":1,"pid":%s,"enabled":%d}\n' "$pid" "$enabled"
+	else
+		printf '{"running":0,"pid":0,"enabled":%d}\n' "$enabled"
+	fi
+}
+
+action_get_bin_info() {
+	local installed=0 version="none" has_cf=0 path=""
+	local arch
+	arch="$(get_arch)"
+
+	config_load caddy 2>/dev/null
+	local conf_bin
+	config_get conf_bin general bin_path "/usr/bin/caddy"
+
+	if [ -x "$conf_bin" ]; then
+		path="$conf_bin"
+	elif [ -x "/usr/bin/caddy" ]; then
+		path="/usr/bin/caddy"
+	elif [ -x "/usr/sbin/caddy" ]; then
+		path="/usr/sbin/caddy"
+	fi
+
+	if [ -n "$path" ] && [ -x "$path" ]; then
+		installed=1
+		local ver_out
+		ver_out="$("$path" version 2>/dev/null | head -n 1)"
+		[ -n "$ver_out" ] && version="$ver_out"
+		if "$path" list-modules 2>/dev/null | grep -qi "cloudflare"; then
+			has_cf=1
+		fi
+	fi
+
+	# Sólo cuentan los directorios incluidos en el paquete. Antes se comprobaba
+	# "./bin" con cwd=/ de rpcd, por lo que /bin hacía que siempre valiera 1.
+	local bundled_available=0
+	if [ -d "/usr/share/caddy/bin" ] || [ -d "/usr/lib/caddy/bin" ]; then
+		bundled_available=1
+	fi
+
+	printf '{"installed":%d,"path":"%s","version":"%s","has_cloudflare":%d,"arch":"%s","bundled_available":%d}\n' \
+		"$installed" "$(json_escape "$path")" "$(json_escape "$version")" "$has_cf" "$arch" "$bundled_available"
+}
+
+action_validate_caddyfile() {
+	local bin
+	bin="$(get_caddy_bin)"
+
+	if [ -z "$bin" ]; then
+		printf '{"valid":false,"output":"Caddy binary not found"}\n'
+		return
+	fi
+
+	if [ ! -s "$CADDYFILE" ]; then
+		if [ -x /usr/lib/caddy/generate-caddyfile.sh ]; then
+			/usr/lib/caddy/generate-caddyfile.sh >/dev/null 2>&1
+		fi
+	fi
+
+	local cf_token
+	cf_token="$(uci -q get caddy.general.cloudflare_token)"
+	is_valid_token "$cf_token" || cf_token=""
+	[ -n "$cf_token" ] && export CLOUDFLARE_API_TOKEN="$cf_token"
+
+	local out code
+	out="$("$bin" validate --config "$CADDYFILE" --adapter caddyfile 2>&1)"
+	code=$?
+
+	if [ $code -eq 0 ]; then
+		printf '{"valid":true,"output":"Configuración válida"}\n'
+	else
+		printf '{"valid":false,"output":"%s"}\n' "$(json_escape "$(mask_secrets "$out")")"
+	fi
+}
+
+# "Probar Caddy": valida la sintaxis y la adaptación del Caddyfile SIN arrancar
+# ningún proceso. Antes se ejecutaba "caddy run" durante 3 s, lo que abría los
+# puertos 80/443, desplazaba la API de administración y realizaba peticiones
+# reales a Let's Encrypt (consumiendo cuota). "caddy adapt" es puramente local.
+action_test_caddy_run() {
+	local bin
+	bin="$(get_caddy_bin)"
+
+	if [ -z "$bin" ]; then
+		printf '{"success":false,"output":"Error: Binario de Caddy no encontrado"}\n'
+		return
+	fi
+
+	if [ ! -s "$CADDYFILE" ]; then
+		if [ -x /usr/lib/caddy/generate-caddyfile.sh ]; then
+			/usr/lib/caddy/generate-caddyfile.sh >/dev/null 2>&1
+		fi
+	fi
+
+	local cf_token
+	cf_token="$(uci -q get caddy.general.cloudflare_token)"
+	is_valid_token "$cf_token" || cf_token=""
+	[ -n "$cf_token" ] && export CLOUDFLARE_API_TOKEN="$cf_token"
+
+	# 1. Validar sintaxis
+	local val_out val_code
+	val_out="$("$bin" validate --config "$CADDYFILE" --adapter caddyfile 2>&1)"
+	val_code=$?
+	if [ $val_code -ne 0 ]; then
+		combined="$(printf '[ERROR DE SINTAXIS]\n%s' "$(mask_secrets "$val_out")")"
+		printf '{"success":false,"output":"%s"}\n' "$(json_escape "$combined")"
+		return
+	fi
+
+	# 2. Adaptar a JSON (comprueba la semántica completa sin abrir puertos)
+	local adapt_out adapt_code
+	adapt_out="$("$bin" adapt --config "$CADDYFILE" --adapter caddyfile 2>&1 >/dev/null)"
+	adapt_code=$?
+	if [ $adapt_code -ne 0 ]; then
+		combined="$(printf '[ERROR DE ADAPTACION]\n%s' "$(mask_secrets "$adapt_out")")"
+		printf '{"success":false,"output":"%s"}\n' "$(json_escape "$combined")"
+		return
+	fi
+
+	local combined
+	combined="$(printf '[SINTAXIS VALIDADA CON EXITO]\n%s\n\n[ADAPTACION A JSON CORRECTA]\nEl Caddyfile es válido y se puede cargar. No se ha arrancado ningún proceso ni se ha contactado con ACME.' "$val_out")"
+	printf '{"success":true,"output":"%s"}\n' "$(json_escape "$(mask_secrets "$combined")")"
+}
+
+action_get_caddyfile() {
+	mkdir -p /etc/caddy
+
+	if [ ! -s "$CADDYFILE" ]; then
+		if [ -x /usr/lib/caddy/generate-caddyfile.sh ]; then
+			/usr/lib/caddy/generate-caddyfile.sh >/dev/null 2>&1
+		elif [ -x /etc/init.d/caddy ]; then
+			/etc/init.d/caddy generate >/dev/null 2>&1
+		fi
+	fi
+
+	local content=""
+	[ -s "$CADDYFILE" ] && content="$(cat "$CADDYFILE")"
+	printf '{"content":"%s","custom":%d}\n' "$(json_escape "$content")" \
+		"$([ "$(uci -q get caddy.general.custom_caddyfile)" = "1" ] && echo 1 || echo 0)"
+}
+
+generate_from_uci() {
+	local force="$1"
+	uci -q commit caddy 2>/dev/null
+
+	# El guardado de proxies/reactivación toma el control del Caddyfile:
+	# se desactiva el modo personalizado conservando una copia de seguridad.
+	if [ "$force" = "1" ] && [ "$(uci -q get caddy.general.custom_caddyfile)" = "1" ]; then
+		[ -s "$CADDYFILE" ] && cp -f "$CADDYFILE" "$CUSTOM_FILE.bak"
+		uci -q set caddy.general.custom_caddyfile='0'
+		uci -q commit caddy
+	fi
+
+	if [ -x /usr/lib/caddy/generate-caddyfile.sh ]; then
+		if [ "$force" = "1" ]; then
+			/usr/lib/caddy/generate-caddyfile.sh --force
+		else
+			/usr/lib/caddy/generate-caddyfile.sh
+		fi
+		return $?
+	fi
+	[ -x /etc/init.d/caddy ] && /etc/init.d/caddy generate >/dev/null 2>&1
+}
+
+action_generate_caddyfile() {
+	local gen_code=0
+	generate_from_uci 1 || gen_code=$?
+
+	local path="$CADDYFILE"
+	local bin
+	bin="$(get_caddy_bin)"
+
+	local valid=1
+	local output="Configuración guardada y Caddyfile generado correctamente"
+
+	if [ "$gen_code" -ne 0 ]; then
+		valid=0
+		output="La configuración generada no es válida. Se conservó el Caddyfile anterior y el servicio sigue funcionando. Revisa los datos introducidos (dominio, email, token)."
+	elif [ -x "$bin" ] && [ -s "$path" ]; then
+		local cf_token
+		cf_token="$(uci -q get caddy.general.cloudflare_token)"
+		is_valid_token "$cf_token" || cf_token=""
+		[ -n "$cf_token" ] && export CLOUDFLARE_API_TOKEN="$cf_token"
+
+		local val_out
+		val_out="$("$bin" validate --config "$path" --adapter caddyfile 2>&1)"
+		if [ $? -ne 0 ]; then
+			valid=0
+			output="$(mask_secrets "$val_out")"
+		else
+			# 1. Asegurar que los puertos 80/443 de LuCI no bloqueen Caddy
+			if [ -x /usr/lib/caddy/free-ports.sh ]; then
+				/usr/lib/caddy/free-ports.sh --quiet
+			fi
+
+			# 2. Aplicar sólo si el servicio está habilitado. NO se fuerza
+			#    enabled=1 (guardar proxies no debe encender el servicio).
+			if [ "$(uci -q get caddy.general.enabled)" = "1" ]; then
+				[ -x /etc/init.d/caddy ] && /etc/init.d/caddy enable >/dev/null 2>&1
+				if [ -n "$(service_pid)" ]; then
+					if reload_running_caddy; then
+						output="Configuración validada y Caddy recargado en caliente con éxito"
+					elif [ -x /etc/init.d/caddy ]; then
+						/etc/init.d/caddy restart >/dev/null 2>&1
+						output="Configuración aplicada reiniciando el servicio"
+					fi
+				elif [ -x /etc/init.d/caddy ]; then
+					/etc/init.d/caddy start >/dev/null 2>&1
+					output="Configuración validada y servicio Caddy iniciado"
+				fi
+			else
+				output="Caddyfile generado. El servicio Caddy está deshabilitado: los cambios se aplicarán al activarlo."
+			fi
+		fi
+	elif [ ! -s "$path" ]; then
+		valid=0
+		output="El archivo /etc/caddy/Caddyfile está vacío o no se pudo generar"
+	fi
+
+	printf '{"success":true,"valid":%s,"output":"%s"}\n' \
+		"$([ $valid -eq 1 ] && echo true || echo false)" "$(json_escape "$output")"
+}
+
+action_sync_from_caddyfile() {
+	if [ -x /etc/init.d/caddy ]; then
+		/etc/init.d/caddy sync_from_caddyfile >/dev/null 2>&1
+	fi
+	printf '{"success":true}\n'
+}
+
+action_set_caddyfile() {
+	local input="$1"
+	[ -n "$input" ] || read -r input
+	mkdir -p /etc/caddy
+
+	local tmp_file="/tmp/caddyfile_upload.$$"
+
+	# Extraer "content" en texto plano con jsonfilter (nativo de OpenWrt)
+	if command -v jsonfilter >/dev/null 2>&1; then
+		jsonfilter -s "$input" -e '@.content' > "$tmp_file" 2>/dev/null
+	fi
+
+	if [ ! -s "$tmp_file" ] || ! grep -q '[^[:space:]]' "$tmp_file"; then
+		rm -f "$tmp_file"
+		printf '{"success":true,"saved":false,"valid":false,"output":"No se recibió contenido o el Caddyfile está vacío. No se ha modificado el archivo activo."}\n'
+		return
+	fi
+
+	local bin
+	bin="$(get_caddy_bin)"
+
+	# Validar SIEMPRE sobre el temporal: el Caddyfile activo sólo se sustituye
+	# si la nueva configuración es válida (evita dejar el servicio inservible).
+	if [ -n "$bin" ]; then
+		local cf_token val_out
+		cf_token="$(uci -q get caddy.general.cloudflare_token)"
+		is_valid_token "$cf_token" || cf_token=""
+		[ -n "$cf_token" ] && export CLOUDFLARE_API_TOKEN="$cf_token"
+		val_out="$("$bin" validate --config "$tmp_file" --adapter caddyfile 2>&1)"
+		if [ $? -ne 0 ]; then
+			rm -f "$tmp_file"
+			combined="$(printf 'Caddyfile NO guardado: la configuración no es válida. El archivo activo no se ha modificado.\n\n%s' "$(mask_secrets "$val_out")")"
+			printf '{"success":true,"saved":false,"valid":false,"output":"%s"}\n' "$(json_escape "$combined")"
+			return
+		fi
+	fi
+
+	# Copia de seguridad y escritura
+	[ -s "$CADDYFILE" ] && cp -f "$CADDYFILE" "$CADDYFILE.bak"
+	mv -f "$tmp_file" "$CADDYFILE"
+	chmod 600 "$CADDYFILE" 2>/dev/null
+	chmod 600 /etc/config/caddy 2>/dev/null
+
+	# Guardar también como Caddyfile personalizado: así los reinicios y los
+	# guardados de otras pestañas no sobrescriben la edición manual.
+	cp -f "$CADDYFILE" "$CUSTOM_FILE" 2>/dev/null
+	chmod 600 "$CUSTOM_FILE" 2>/dev/null
+	uci -q set caddy.general.custom_caddyfile='1'
+	uci -q commit caddy
+
+	# Aplicar: recarga en caliente si corre, o arranca si está habilitado
+	if [ -n "$(service_pid)" ]; then
+		reload_running_caddy || { [ -x /etc/init.d/caddy ] && /etc/init.d/caddy restart >/dev/null 2>&1; }
+	elif [ "$(uci -q get caddy.general.enabled)" = "1" ] && [ -x /etc/init.d/caddy ]; then
+		/etc/init.d/caddy start >/dev/null 2>&1
+	fi
+
+	printf '{"success":true,"saved":true,"valid":true,"output":"Archivo guardado en /etc/caddy/Caddyfile y activado el modo personalizado (las ediciones ya no se sobrescriben al guardar otras pestañas ni al reiniciar)."}\n'
+}
+
+action_restore_generated() {
+	uci -q set caddy.general.custom_caddyfile='0'
+	uci -q commit caddy
+
+	local gen_code=0
+	generate_from_uci 1 || gen_code=$?
+
+	local valid=1 output="Caddyfile regenerado desde la configuración UCI"
+	if [ "$gen_code" -ne 0 ]; then
+		valid=0
+		output="No se pudo generar un Caddyfile válido desde UCI. Se conserva el archivo anterior."
+	fi
+
+	if [ "$valid" -eq 1 ]; then
+		if [ -n "$(service_pid)" ]; then
+			reload_running_caddy || { [ -x /etc/init.d/caddy ] && /etc/init.d/caddy restart >/dev/null 2>&1; }
+		elif [ "$(uci -q get caddy.general.enabled)" = "1" ] && [ -x /etc/init.d/caddy ]; then
+			/etc/init.d/caddy start >/dev/null 2>&1
+		fi
+	fi
+
+	printf '{"success":true,"valid":%s,"output":"%s"}\n' \
+		"$([ $valid -eq 1 ] && echo true || echo false)" "$(json_escape "$output")"
+}
+
+action_sync_general() {
+	uci -q commit caddy
+
+	# El generador respeta custom_caddyfile: en modo personalizado no pisa la
+	# edición manual del usuario.
+	local gen_code=0
+	generate_from_uci 0 || gen_code=$?
+
+	local enabled valid=1 output="Configuración general sincronizada"
+	enabled="$(uci -q get caddy.general.enabled || echo 0)"
+	if [ "$gen_code" -ne 0 ]; then
+		valid=0
+		output="La configuración no es válida; se conserva el Caddyfile anterior"
+	fi
+
+	if [ "$enabled" = "1" ]; then
+		[ -x /etc/init.d/caddy ] && /etc/init.d/caddy enable >/dev/null 2>&1
+		if [ -x /etc/init.d/caddy ]; then
+			if [ -n "$(service_pid)" ] && [ "$valid" -eq 1 ]; then
+				/etc/init.d/caddy reload >/dev/null 2>&1 || /etc/init.d/caddy restart >/dev/null 2>&1
+			else
+				/etc/init.d/caddy restart >/dev/null 2>&1
+			fi
+		fi
+	else
+		[ -x /etc/init.d/caddy ] && /etc/init.d/caddy stop >/dev/null 2>&1
+		[ -x /etc/init.d/caddy ] && /etc/init.d/caddy disable >/dev/null 2>&1
+	fi
+
+	printf '{"success":true,"valid":%s,"output":"%s"}\n' \
+		"$([ $valid -eq 1 ] && echo true || echo false)" "$(json_escape "$output")"
+}
+
+action_service_action() {
+	local action="$1"
+	case "$action" in
+		start)
+			# El botón "Iniciar" debe arrancar Caddy aunque enabled=0 en UCI
+			uci -q set caddy.general.enabled='1'
+			uci -q commit caddy
+			[ -x /etc/init.d/caddy ] && /etc/init.d/caddy enable >/dev/null 2>&1
+			/etc/init.d/caddy start >/dev/null 2>&1
+			printf '{"success":true,"action":"%s"}\n' "$action"
+			;;
+		stop|restart|reload|enable|disable)
+			/etc/init.d/caddy "$action" >/dev/null 2>&1
+			printf '{"success":true,"action":"%s"}\n' "$action"
+			;;
+		*)
+			printf '{"success":false,"error":"Invalid action"}\n'
+			;;
+	esac
+}
+
+action_install_bin() {
+	local mode="$1"
+	local script="/usr/lib/caddy/caddy-installer.sh"
+
+	if [ "$mode" = "apk" ]; then
+		if command -v apk >/dev/null 2>&1; then
+			local apk_res
+			apk_res="$(apk add caddy 2>&1)"
+			if [ $? -eq 0 ]; then
+				printf '{"success":true,"message":"Installed caddy via apk successfully"}\n'
+			else
+				printf '{"success":false,"message":"%s"}\n' "$(json_escape "$apk_res")"
+			fi
+			return
+		elif command -v opkg >/dev/null 2>&1; then
+			local opkg_res
+			opkg_res="$(opkg update && opkg install caddy 2>&1)"
+			if [ $? -eq 0 ]; then
+				printf '{"success":true,"message":"Installed caddy via opkg successfully"}\n'
+			else
+				printf '{"success":false,"message":"%s"}\n' "$(json_escape "$opkg_res")"
+			fi
+			return
+		fi
+	fi
+
+	if [ -x "$script" ]; then
+		local flag="--install"
+		[ "$mode" = "force" ] && flag="--force"
+		local out code
+		out="$("$script" $flag 2>&1)"
+		code=$?
+		if [ $code -eq 0 ]; then
+			printf '{"success":true,"message":"%s"}\n' "$(json_escape "$out")"
+		else
+			printf '{"success":false,"message":"%s"}\n' "$(json_escape "$out")"
+		fi
+		return
+	fi
+
+	printf '{"success":false,"message":"No installer script found"}\n'
+}
+
+action_free_ports() {
+	if [ -x /usr/lib/caddy/free-ports.sh ]; then
+		local out
+		out="$(/usr/lib/caddy/free-ports.sh --json 2>/dev/null)"
+		if [ -n "$out" ]; then
+			printf '%s\n' "$out"
+		else
+			printf '{"success":true,"message":"Puertos 80 y 443 liberados exitosamente"}\n'
+		fi
+	else
+		printf '{"success":false,"message":"No se encontró /usr/lib/caddy/free-ports.sh"}\n'
+	fi
+}
+
+case "$1" in
+	list)
+		cat <<EOF
+{
+	"status": {},
+	"get_bin_info": {},
+	"validate_caddyfile": {},
+	"test_caddy_run": {},
+	"get_caddyfile": {},
+	"generate_caddyfile": {},
+	"sync_from_caddyfile": {},
+	"set_caddyfile": { "content": "String" },
+	"restore_generated": {},
+	"sync_general": {},
+	"service_action": { "action": "String" },
+	"install_bin": { "source": "String" },
+	"free_ports": {}
+}
+EOF
+		;;
+	call)
+		case "$2" in
+			status)
+				action_status
+				;;
+			get_bin_info)
+				action_get_bin_info
+				;;
+			validate_caddyfile)
+				action_validate_caddyfile
+				;;
+			test_caddy_run)
+				action_test_caddy_run
+				;;
+			get_caddyfile)
+				action_get_caddyfile
+				;;
+			generate_caddyfile)
+				action_generate_caddyfile
+				;;
+			sync_from_caddyfile)
+				action_sync_from_caddyfile
+				;;
+			set_caddyfile)
+				read -r input
+				action_set_caddyfile "$input"
+				;;
+			restore_generated)
+				action_restore_generated
+				;;
+			sync_general)
+				action_sync_general
+				;;
+			service_action)
+				read -r input
+				action="$(echo "$input" | grep -o '"action"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)"
+				action_service_action "$action"
+				;;
+			install_bin)
+				read -r input
+				source="$(echo "$input" | grep -o '"source"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)"
+				action_install_bin "$source"
+				;;
+			free_ports)
+				action_free_ports
+				;;
+			*)
+				printf '{"error":"Unsupported method"}\n'
+				;;
+		esac
+		;;
+	*)
+		printf 'Usage: %s {list|call <method>}\n' "$0"
+		exit 1
+		;;
+esac

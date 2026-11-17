@@ -1,0 +1,236 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+EXTRA_COMMANDS="generate sync_from_caddyfile"
+EXTRA_HELP="    generate            Genera el archivo /etc/caddy/Caddyfile a partir de la configuración UCI
+    sync_from_caddyfile Sincroniza las reglas de /etc/caddy/Caddyfile hacia la configuración UCI"
+
+CONF_DIR="/etc/caddy"
+CADDYFILE="$CONF_DIR/Caddyfile"
+DATA_DIR="/etc/caddy/data"
+CONFIG_STORAGE="/etc/caddy/config"
+
+get_bin() {
+	local bin_path
+	config_get bin_path general bin_path "/usr/bin/caddy"
+	if [ -x "$bin_path" ]; then
+		echo "$bin_path"
+		return 0
+	elif [ -x "/usr/bin/caddy" ]; then
+		echo "/usr/bin/caddy"
+		return 0
+	elif [ -x "/usr/sbin/caddy" ]; then
+		echo "/usr/sbin/caddy"
+		return 0
+	fi
+	return 1
+}
+
+# Un token de Cloudflare válido son sólo letras, números, guiones y guiones
+# bajos. Cualquier otro carácter (comillas, llaves, espacios) hace que Caddy
+# falle al cargar el módulo ACME y deja el servicio caído. En ese caso el
+# generador ya omite acme_dns; aquí sólo decidimos si pasarlo como entorno.
+is_valid_token() {
+	case "$1" in
+		"") return 1 ;;
+		*[!A-Za-z0-9_-]*) return 1 ;;
+	esac
+	[ "${#1}" -ge 32 ] || return 1
+	return 0
+}
+
+mask_token() {
+	local msg="$1" tok
+	tok="$(uci -q get caddy.general.cloudflare_token)"
+	[ -n "$tok" ] && msg="$(echo "$msg" | sed "s|$tok|***|g")"
+	printf '%s' "$msg"
+}
+
+generate_caddyfile() {
+	if [ ! -x /usr/lib/caddy/generate-caddyfile.sh ]; then
+		logger -t caddy "Error: no se encontró /usr/lib/caddy/generate-caddyfile.sh"
+		return 1
+	fi
+	/usr/lib/caddy/generate-caddyfile.sh
+	return $?
+}
+
+generate() {
+	generate_caddyfile
+}
+
+sync_from_caddyfile() {
+	[ -f "$CADDYFILE" ] || return 0
+
+	# Si el archivo no tiene reverse_proxy, no hay nada que importar
+	grep -q "reverse_proxy" "$CADDYFILE" 2>/dev/null || return 0
+
+	local tmp_script="/tmp/caddy_import.$$.sh"
+	awk '
+	BEGIN { in_block = 0; name = ""; domain = ""; upstream = ""; tls = "auto"; trans = 0; headers = "" }
+	!in_block && /^#[[:space:]]*Proxy:[[:space:]]*/ {
+		sub(/^#[[:space:]]*Proxy:[[:space:]]*/, "")
+		name = $0
+		next
+	}
+	!in_block && /^#[[:space:]]*[0-9]+[.][[:space:]]*/ {
+		sub(/^#[[:space:]]*[0-9]+[.][[:space:]]*/, "")
+		name = $0
+		next
+	}
+	!in_block && /^(https?:\/\/)?[a-zA-Z0-9.:_-]+[[:space:]]*\{/ {
+		line = $0
+		sub(/[[:space:]]*\{.*$/, "", line)
+		domain = line
+		# Dirección http:// explicita => TLS desactivado
+		if (domain ~ /^http:\/\//) { tls = "off"; sub(/^http:\/\//, "", domain) }
+		sub(/^https:\/\//, "", domain)
+		in_block = 1
+		next
+	}
+	in_block {
+		if (/reverse_proxy/) {
+			for (i=1; i<=NF; i++) {
+				if ($i == "reverse_proxy" && $(i+1) != "") {
+					upstream = $(i+1)
+					break
+				}
+			}
+		}
+		if (/dns[[:space:]]+cloudflare/) tls = "cloudflare"
+		if (/tls[[:space:]]+internal/) tls = "internal"
+		if (/header_up[[:space:]]+Host/) trans = 1
+		# Directivas extra dentro de reverse_proxy (no las estándar)
+		if (/^[[:space:]]+header_up[[:space:]]+/ && $0 !~ /header_up[[:space:]]+(Host|X-Real-IP)/) {
+			line = $0
+			sub(/^[[:space:]]+/, "", line)
+			headers = (headers == "") ? line : headers "\n" line
+		}
+		if (/^\}/) {
+			if (domain != "" && domain !~ /^\{/ && upstream != "") {
+				if (name == "") name = domain
+				print "sec=$(uci -q add caddy proxy)"
+				print "uci -q set caddy.$sec.name=\"" name "\""
+				print "uci -q set caddy.$sec.domain=\"" domain "\""
+				print "uci -q set caddy.$sec.upstream=\"" upstream "\""
+				print "uci -q set caddy.$sec.tls_mode=\"" tls "\""
+				print "uci -q set caddy.$sec.transparent=\"" trans "\""
+				if (headers != "") {
+					gsub(/\n/, "\\n", headers)
+					print "uci -q set caddy.$sec.custom_headers=\"" headers "\""
+				}
+				print "uci -q set caddy.$sec.enabled=\"1\""
+			}
+			in_block = 0
+			name = ""
+			domain = ""
+			upstream = ""
+			tls = "auto"
+			trans = 0
+			headers = ""
+		}
+	}
+	' "$CADDYFILE" > "$tmp_script"
+
+	if [ -s "$tmp_script" ]; then
+		# Eliminar proxies existentes usando índices posicionales estables.
+		# (uci show devuelve "@proxy[N]" en OpenWrt 25.x, no "cfgXXXXXX",
+		#  por lo que "uci delete caddy.@proxy[0]" en bucle es la forma fiable)
+		while uci -q get "caddy.@proxy[0]" >/dev/null 2>&1; do
+			uci -q delete "caddy.@proxy[0]"
+		done
+		. "$tmp_script"
+		uci -q commit caddy
+	fi
+	rm -f "$tmp_script"
+}
+
+start_service() {
+	config_load caddy
+
+	local enabled
+	config_get_bool enabled general enabled 0
+	[ "$enabled" -eq 1 ] || return 0
+
+	local bin
+	bin="$(get_bin)"
+	if [ -z "$bin" ]; then
+		logger -t caddy "Error: Caddy binary not found. Please install Caddy first."
+		return 1
+	fi
+
+	local cf_token
+	config_get cf_token general cloudflare_token ""
+	is_valid_token "$cf_token" || cf_token=""
+
+	local http_port https_port
+	config_get http_port general http_port "80"
+	config_get https_port general https_port "443"
+
+	# Asegurar que uhttpd no siga bloqueando los puertos configurados para Caddy
+	if [ -x /usr/lib/caddy/free-ports.sh ] && [ -f /etc/config/uhttpd ]; then
+		if grep -qE "(:${http_port}['\"]|'${http_port}'|\"${http_port}\"|:${http_port}([[:space:]]|$))" /etc/config/uhttpd || \
+		   grep -qE "(:${https_port}['\"]|'${https_port}'|\"${https_port}\"|:${https_port}([[:space:]]|$))" /etc/config/uhttpd; then
+			logger -t caddy "Liberando puertos $http_port / $https_port ocupados por uhttpd..."
+			/usr/lib/caddy/free-ports.sh --quiet
+		fi
+	fi
+
+	# Generar Caddyfile actualizado desde UCI (el generador respeta el modo
+	# personalizado: si custom_caddyfile=1 conserva la edición del usuario).
+	# Si la generación falla (config inválida) se conserva el Caddyfile anterior
+	# y se intenta arrancar con él en lugar de dejar el servicio caído.
+	if ! generate_caddyfile; then
+		logger -t caddy "Failed to generate Caddyfile; using existing $CADDYFILE if valid"
+		[ -s "$CADDYFILE" ] || return 1
+	fi
+
+	# Validate Caddyfile
+	[ -n "$cf_token" ] && export CLOUDFLARE_API_TOKEN="$cf_token"
+	if ! "$bin" validate --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1; then
+		local err_msg
+		err_msg="$("$bin" validate --config "$CADDYFILE" --adapter caddyfile 2>&1)"
+		logger -t caddy "Validation failed for $CADDYFILE: $(mask_token "$err_msg")"
+		return 1
+	fi
+
+	procd_open_instance caddy
+	procd_set_param command "$bin" run --config "$CADDYFILE" --adapter caddyfile
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+
+	# Persistent certificate storage and Cloudflare credentials.
+	# NOTE: procd only keeps one "env" JSON object per instance, so all
+	# variables must be passed in a SINGLE procd_set_param env call.
+	local env_vars="XDG_DATA_HOME=$DATA_DIR XDG_CONFIG_HOME=$CONFIG_STORAGE"
+	[ -n "$cf_token" ] && env_vars="$env_vars CLOUDFLARE_API_TOKEN=$cf_token"
+	procd_set_param env $env_vars
+
+	procd_set_param limits core="unlimited" nofile="65535 65535"
+	procd_close_instance
+}
+
+reload_service() {
+	local bin
+	bin="$(get_bin)"
+	if [ -n "$bin" ]; then
+		config_load caddy
+		# El generador respeta custom_caddyfile (ediciones manuales)
+		generate_caddyfile
+		local cf_token
+		config_get cf_token general cloudflare_token ""
+		is_valid_token "$cf_token" || cf_token=""
+		[ -n "$cf_token" ] && export CLOUDFLARE_API_TOKEN="$cf_token"
+		"$bin" reload --config "$CADDYFILE" --adapter caddyfile >/dev/null 2>&1 || restart
+	else
+		restart
+	fi
+}
+
+service_triggers() {
+	procd_add_reload_trigger "caddy"
+}

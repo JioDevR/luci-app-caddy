@@ -1,0 +1,98 @@
+# ===========================================================================
+#  luci-app-caddy — reglas de exclusión para Git
+# ===========================================================================
+#
+#  Nota: el paquete final (dist/*.apk) es un artefacto de compilación y se
+#  ignora por defecto. Se regenera con ./build_apk.sh. Si prefieres
+#  versionarlo, descomenta las excepciones del final.
+#
+#  Los binarios de Caddy (bin/caddy_linux_*_custom) SÍ forman parte del
+#  proyecto: build_apk.sh los necesita para construir el paquete todo-en-uno.
+#  Son grandes (~89 MB en total); si el repositorio va a publicarse, considera
+#  Git LFS para esa carpeta.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Sistema operativo / editores
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*.kate-swp
+*~
+.vscode/
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+# ---------------------------------------------------------------------------
+# Artefactos de compilación del paquete
+# ---------------------------------------------------------------------------
+dist/*.apk
+dist/*.apk.sha256
+dist/*.ipk
+*.ipk
+
+# ---------------------------------------------------------------------------
+# Temporales de empaquetado y parches
+# ---------------------------------------------------------------------------
+*.postinst
+*.post-upgrade
+/post-install
+/post-upgrade
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+core
+core.*
+
+# ---------------------------------------------------------------------------
+# Logs y volcados
+# ---------------------------------------------------------------------------
+*.log
+*.pid
+*.dump
+
+# ---------------------------------------------------------------------------
+# Claves y secretos (NUNCA versionar claves privadas ni tokens)
+# ---------------------------------------------------------------------------
+*.key
+*.priv
+private*.pem
+*private*.pem
+.abuild/
+/secrets/
+.env
+.env.*
+
+# Las claves públicas de firma sí se pueden versionar (p. ej. para un repo
+# local): no se ignoran los ficheros *.pub.
+
+# ---------------------------------------------------------------------------
+# Entornos locales de desarrollo / pruebas
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+node_modules/
+npm-debug.log*
+playwright-report/
+test-results/
+.opencode/
+
+# ---------------------------------------------------------------------------
+# Excepciones: descomenta si quieres versionar el paquete final
+# ---------------------------------------------------------------------------
+#!dist/luci-app-caddy.apk
+#!dist/luci-app-caddy.apk.sha256
